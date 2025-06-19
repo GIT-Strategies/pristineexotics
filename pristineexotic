@@ -1,0 +1,270 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc, onSnapshot, updateDoc, writeBatch, getDocs, query, limit, arrayUnion } from 'firebase/firestore';
+import { Car, Building, CheckCircle, XCircle, Wrench, X, ClipboardList, GaugeCircle, DollarSign, TrendingUp } from 'lucide-react';
+
+// --- Helper Components ---
+const CarDetail = ({ icon: Icon, label, value }) => (
+    <div className="flex items-center text-sm text-slate-600">
+        <Icon size={16} className="mr-2 text-slate-400" />
+        <span><strong>{label}:</strong> {value}</span>
+    </div>
+);
+
+const FullPageMessage = ({ title, message }) => (
+    <div className="flex items-center justify-center min-h-screen bg-slate-50">
+        <div className="text-center p-8 bg-white rounded-xl shadow-md">
+            <h1 className="text-2xl font-bold text-slate-800 mb-2">{title}</h1>
+            <p className="text-slate-500">{message}</p>
+        </div>
+    </div>
+);
+
+// --- Main App Component ---
+export default function App() {
+    // --- State Management ---
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [cars, setCars] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [isModalOpen, setIsModalOpen] = useState(false);
+    const [selectedCar, setSelectedCar] = useState(null);
+
+    // --- Firebase Configuration ---
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'car-rental-default';
+    
+    // --- Seed Data with All Hub Fields ---
+    const seedData = [
+      { name: 'Ferrari 488', year: 2022, type: 'Supercar', pricePerDay: 1500, imageUrl: 'https://placehold.co/600x400/EFEFEF/1E293B?text=Ferrari+488', status: 'Available', lastServiceDate: '2025-04-10', nextServiceDate: '2026-04-10', serviceHistory: [{ date: '2025-04-10', notes: 'Annual fluid service & inspection.', cost: 1800 }], currentMileage: 8750, conditionLog: [{date: '2025-06-15', note: 'Post-rental inspection. All clear.'}], totalDaysRented: 45, lifetimeRevenue: 67500 },
+      { name: 'Lamborghini Huracan', year: 2023, type: 'Supercar', pricePerDay: 1750, imageUrl: 'https://placehold.co/600x400/EFEFEF/1E293B?text=Lambo+Huracan', status: 'Rented', lastServiceDate: '2025-05-20', nextServiceDate: '2025-08-20', serviceHistory: [{ date: '2025-05-20', notes: 'Tire rotation and brake check.', cost: 950 }], currentMileage: 5400, conditionLog: [{date: '2025-06-18', note: 'Pre-rental check. Ready for client.'}], totalDaysRented: 92, lifetimeRevenue: 161000 },
+      { name: 'Porsche 911 GT3', year: 2023, type: 'Sports Car', pricePerDay: 1200, imageUrl: 'https://placehold.co/600x400/EFEFEF/1E293B?text=Porsche+911+GT3', status: 'Available', lastServiceDate: '2025-01-15', nextServiceDate: '2026-01-15', serviceHistory: [{ date: '2025-01-15', notes: 'Initial break-in service.', cost: 1100 }], currentMileage: 11200, conditionLog: [], totalDaysRented: 115, lifetimeRevenue: 138000 },
+      { name: 'McLaren 720S', year: 2022, type: 'Supercar', pricePerDay: 1900, imageUrl: 'https://placehold.co/600x400/EFEFEF/1E293B?text=McLaren+720S', status: 'Available', lastServiceDate: '2025-03-01', nextServiceDate: '2025-09-01', serviceHistory: [{ date: '2025-03-01', notes: 'Scheduled 6-month checkup.', cost: 1350 }], currentMileage: 7100, conditionLog: [{date: '2025-05-30', note: 'Full detail and ceramic coat touch-up.'}], totalDaysRented: 68, lifetimeRevenue: 129200 },
+    ];
+    
+    // --- Firebase Initialization & Auth Effect ---
+    useEffect(() => {
+        try {
+            const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+            const firebaseConfig = JSON.parse(firebaseConfigStr);
+            if (!firebaseConfig || Object.keys(firebaseConfig).length === 0) { setError("Firebase configuration is missing."); setLoading(false); return; }
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+            setDb(firestoreDb); setAuth(firebaseAuth);
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) { setUserId(user.uid); } 
+                else {
+                    try { if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) { await signInWithCustomToken(firebaseAuth, __initial_auth_token); } else { await signInAnonymously(firebaseAuth); } }
+                    catch (authError) { console.error("Auth failed:", authError); setError("Could not authenticate user."); }
+                }
+                setIsAuthReady(true);
+            });
+            return () => unsubscribe();
+        } catch (e) { console.error("Init Error:", e); setError("A critical error occurred."); setLoading(false); }
+    }, []);
+    
+    // --- Data Seeding and Fetching Logic ---
+    useEffect(() => {
+        if (!isAuthReady || !db) {
+            return;
+        }
+
+        let unsubscribe = () => {}; // Initialize with an empty function
+
+        const setupListener = async () => {
+            const collectionPath = `artifacts/${appId}/public/data/cars`;
+            const carsCollectionRef = collection(db, collectionPath);
+            try {
+                const q = query(carsCollectionRef, limit(1));
+                const snapshot = await getDocs(q);
+                if (snapshot.empty) {
+                    console.log("Seeding database...");
+                    const batch = writeBatch(db);
+                    seedData.forEach(carData => {
+                        const docRef = doc(carsCollectionRef);
+                        batch.set(docRef, carData);
+                    });
+                    await batch.commit();
+                }
+
+                unsubscribe = onSnapshot(carsCollectionRef, (querySnapshot) => {
+                    const carsData = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setCars(carsData);
+                    if (selectedCar) {
+                        const updatedCar = carsData.find(c => c.id === selectedCar.id);
+                        if (updatedCar) setSelectedCar(updatedCar);
+                    }
+                    setLoading(false);
+                }, (err) => {
+                    console.error("Fetch Error:", err);
+                    setError("Failed to load inventory.");
+                    setLoading(false);
+                });
+
+            } catch (e) {
+                console.error("Data setup error:", e);
+                setError("Could not prepare database.");
+                setLoading(false);
+            }
+        };
+
+        setupListener();
+
+        return () => {
+            unsubscribe(); // This is now guaranteed to be a function.
+        };
+    }, [isAuthReady, db, appId]);
+    
+    // --- Event Handlers ---
+    const handleToggleStatus = async (carId, currentStatus) => { if (!db) return; const newStatus = currentStatus === 'Available' ? 'Rented' : 'Available'; const carDocRef = doc(db, `artifacts/${appId}/public/data/cars`, carId); try { await updateDoc(carDocRef, { status: newStatus }); } catch (e) { console.error("Status Update Error:", e); } };
+    
+    const handleOpenModal = (car) => { setSelectedCar(car); setIsModalOpen(true); };
+    const handleCloseModal = () => { setIsModalOpen(false); setSelectedCar(null); };
+
+    const handleSaveData = async (carId, dataToUpdate) => {
+        if (!db) return;
+        const carDocRef = doc(db, `artifacts/${appId}/public/data/cars`, carId);
+        try { await updateDoc(carDocRef, dataToUpdate); } 
+        catch (e) { console.error("Error saving data:", e); }
+    };
+
+    // --- Render Guards ---
+    if (error) { return <FullPageMessage title="Application Error" message={error} />; }
+    if (loading || !isAuthReady) { return <FullPageMessage title="Loading Fleet" message="Please wait while we get everything ready..." />; }
+
+    // --- Main Render ---
+    return (
+        <div className="bg-slate-100 min-h-screen font-sans text-slate-800">
+            {isModalOpen && <VehicleHubModal car={selectedCar} onClose={handleCloseModal} onSave={handleSaveData} />}
+            <header className="bg-white shadow-sm sticky top-0 z-20">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                    <div className="flex items-center">
+                         <Building className="w-8 h-8 text-blue-600 mr-3" />
+                         <h1 className="text-2xl font-bold text-slate-900"> Pristine Exotics </h1>
+                    </div>
+                    {userId && <div className="text-xs text-slate-400" title={`User ID: ${userId}`}>User ID: {userId.substring(0,8)}...</div>}
+                </div>
+            </header>
+            <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                    {cars.map((car) => <CarCard key={car.id} car={car} onToggleStatus={handleToggleStatus} onOpenModal={handleOpenModal} />)}
+                </div>
+            </main>
+        </div>
+    );
+}
+
+// --- CarCard Component ---
+const CarCard = ({ car, onToggleStatus, onOpenModal }) => {
+    const isAvailable = car.status === 'Available';
+    const isServiceDueSoon = car.nextServiceDate && new Date(car.nextServiceDate) < new Date(new Date().setMonth(new Date().getMonth() + 2));
+
+    return (
+        <div className="bg-white rounded-xl shadow-lg overflow-hidden hover:shadow-2xl transition-shadow duration-300 flex flex-col">
+            <div className="relative">
+                <img className="w-full h-56 object-cover" src={car.imageUrl} alt={`Image of ${car.name}`} onError={(e) => { e.target.onerror = null; e.target.src='https://placehold.co/600x400/CCCCCC/FFFFFF?text=Image+Error';}} />
+                <div className={`absolute top-3 right-3 px-3 py-1 text-xs font-semibold rounded-full flex items-center ${isAvailable ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'}`}>
+                    {isAvailable ? <CheckCircle size={14} className="mr-1.5" /> : <XCircle size={14} className="mr-1.5" />} {car.status}
+                </div>
+            </div>
+            <div className="p-6 flex-grow flex flex-col">
+                <h2 className="text-2xl font-bold text-slate-900">{car.name}</h2>
+                <p className="text-sm text-slate-500 mb-4">{car.year}</p>
+                <div className="space-y-3 mb-6 flex-grow">
+                    <CarDetail icon={DollarSign} label="Price" value={`$${(car.pricePerDay || 0).toLocaleString()}/day`} />
+                    <CarDetail icon={GaugeCircle} label="Mileage" value={`${(car.currentMileage || 0).toLocaleString()} mi`} />
+                    {isServiceDueSoon && <div className="!mt-4 flex items-center text-sm font-semibold text-amber-600 bg-amber-50 p-2 rounded-lg"> <Wrench size={16} className="mr-2"/> Service Due: {new Date(car.nextServiceDate).toLocaleDateString()} </div> }
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => onOpenModal(car)} className="w-full py-3 px-4 rounded-lg font-semibold text-slate-700 bg-slate-200 hover:bg-slate-300 transition-colors duration-300 flex items-center justify-center"> <ClipboardList size={16} className="mr-2"/> View Hub </button>
+                    <button onClick={() => onToggleStatus(car.id, car.status)} className={`w-full py-3 px-4 rounded-lg font-semibold text-white transition-colors duration-300 flex items-center justify-center ${isAvailable ? 'bg-blue-600 hover:bg-blue-700' : 'bg-orange-500 hover:bg-orange-600'}`}>
+                        {isAvailable ? 'Mark Rented' : 'Mark Available'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- VehicleHubModal Component ---
+const VehicleHubModal = ({ car, onClose, onSave }) => {
+    // State for forms
+    const [serviceNotes, setServiceNotes] = useState('');
+    const [serviceCost, setServiceCost] = useState('');
+    const [serviceDate, setServiceDate] = useState(new Date().toISOString().split('T')[0]);
+    const [nextServiceDate, setNextServiceDate] = useState(car.nextServiceDate || '');
+    const [conditionNote, setConditionNote] = useState('');
+    const [currentMileage, setCurrentMileage] = useState(car.currentMileage || 0);
+
+    const handleServiceSubmit = (e) => { e.preventDefault(); if (!serviceNotes.trim() || !serviceDate) return; const newRecord = { date: serviceDate, notes: serviceNotes.trim(), cost: Number(serviceCost) || 0 }; onSave(car.id, { serviceHistory: arrayUnion(newRecord), lastServiceDate: serviceDate, nextServiceDate: nextServiceDate }); setServiceNotes(''); setServiceCost(''); };
+    const handleConditionSubmit = (e) => { e.preventDefault(); if (!conditionNote.trim()) return; const newLog = { date: new Date().toISOString().split('T')[0], note: conditionNote.trim() }; onSave(car.id, { conditionLog: arrayUnion(newLog), currentMileage: Number(currentMileage) }); setConditionNote(''); };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-[90vh] flex flex-col">
+                <header className="p-6 border-b border-slate-200 flex justify-between items-center flex-shrink-0">
+                    <div>
+                         <h2 className="text-2xl font-bold text-slate-800">{car.name}</h2>
+                         <p className="text-slate-500">Vehicle Health & Service Hub</p>
+                    </div>
+                    <button onClick={onClose} className="p-2 rounded-full hover:bg-slate-100 text-slate-500"> <X size={24} /> </button>
+                </header>
+
+                <main className="p-6 flex-grow overflow-y-auto grid grid-cols-1 lg:grid-cols-3 gap-x-8">
+                    {/* --- Maintenance Section --- */}
+                    <section className="flex flex-col">
+                        <h3 className="text-lg font-semibold text-slate-700 mb-4 flex items-center"><Wrench size={20} className="mr-2 text-blue-600"/>Service History</h3>
+                        <div className="space-y-3 mb-6 flex-grow h-48 overflow-y-auto pr-2">
+                            {car.serviceHistory?.length > 0 ? [...car.serviceHistory].reverse().map((item, i) => <div key={i} className="bg-slate-50 p-3 rounded-lg text-sm"><p className="font-semibold text-slate-800">{item.notes}</p><div className="text-slate-500 flex justify-between mt-1"><span>{new Date(item.date).toLocaleDateString()}</span>{item.cost > 0 && <span>${item.cost.toLocaleString()}</span>}</div></div>) : <p className="text-slate-500 text-sm">No service history.</p>}
+                        </div>
+                        <form onSubmit={handleServiceSubmit} className="space-y-4">
+                            <h4 className="text-md font-semibold text-slate-600 mt-4">Log New Service</h4>
+                            <textarea value={serviceNotes} onChange={e => setServiceNotes(e.target.value)} required className="w-full p-2 border rounded-lg" rows="2" placeholder="e.g., Annual oil change..."></textarea>
+                            <div className="grid grid-cols-2 gap-4"><input type="date" value={serviceDate} onChange={e => setServiceDate(e.target.value)} required className="w-full p-2 border rounded-lg" /><input type="number" value={serviceCost} onChange={e => setServiceCost(e.target.value)} className="w-full p-2 border rounded-lg" placeholder="Cost ($)" /></div>
+                            <div><label className="text-sm font-medium text-slate-600">Next Service Date</label><input type="date" value={nextServiceDate} onChange={e => setNextServiceDate(e.target.value)} required className="w-full p-2 border rounded-lg" /></div>
+                            <button type="submit" className="w-full bg-blue-600 text-white font-bold py-2.5 rounded-lg hover:bg-blue-700">Save Service</button>
+                        </form>
+                    </section>
+                    
+                    {/* --- Condition Section --- */}
+                    <section className="flex flex-col mt-8 lg:mt-0">
+                         <h3 className="text-lg font-semibold text-slate-700 mb-4 flex items-center"><ClipboardList size={20} className="mr-2 text-green-600"/>Condition Log</h3>
+                         <div className="space-y-3 mb-6 flex-grow h-48 overflow-y-auto pr-2">
+                            {car.conditionLog?.length > 0 ? [...car.conditionLog].reverse().map((item, i) => <div key={i} className="bg-slate-50 p-3 rounded-lg text-sm"><p className="font-semibold text-slate-800">{item.note}</p><div className="text-slate-500 text-right mt-1"><span>{new Date(item.date).toLocaleDateString()}</span></div></div>) : <p className="text-slate-500 text-sm">No condition notes.</p>}
+                        </div>
+                        <form onSubmit={handleConditionSubmit} className="space-y-4">
+                            <h4 className="text-md font-semibold text-slate-600 mt-4">Log New Condition Entry</h4>
+                             <div><label className="text-sm font-medium text-slate-600">Current Mileage</label><input type="number" value={currentMileage} onChange={e => setCurrentMileage(e.target.value)} required className="w-full p-2 border rounded-lg" /></div>
+                            <textarea value={conditionNote} onChange={e => setConditionNote(e.target.value)} required className="w-full p-2 border rounded-lg" rows="2" placeholder="e.g., Pre-rental check, all clear..."></textarea>
+                            <button type="submit" className="w-full bg-green-600 text-white font-bold py-2.5 rounded-lg hover:bg-green-700">Save Condition</button>
+                        </form>
+                    </section>
+
+                    {/* --- Revenue Section --- */}
+                     <section className="flex flex-col mt-8 lg:mt-0">
+                         <h3 className="text-lg font-semibold text-slate-700 mb-4 flex items-center"><TrendingUp size={20} className="mr-2 text-purple-600"/>Revenue Snapshot</h3>
+                         <div className="bg-slate-50 rounded-lg p-6 space-y-5">
+                            <div className="flex items-center justify-between">
+                                <span className="font-semibold text-slate-600">Total Days Rented</span>
+                                <span className="font-bold text-2xl text-slate-800">{car.totalDaysRented || 0}</span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                                <span className="font-semibold text-slate-600">Avg. Daily Rate</span>
+                                <span className="font-medium text-lg text-slate-700">${(car.pricePerDay || 0).toLocaleString()}</span>
+                            </div>
+                             <div className="border-t border-slate-200 my-4"></div>
+                             <div className="flex items-center justify-between">
+                                <span className="font-semibold text-slate-600">Lifetime Revenue</span>
+                                <span className="font-bold text-3xl text-purple-600">${(car.lifetimeRevenue || 0).toLocaleString()}</span>
+                            </div>
+                         </div>
+                    </section>
+                </main>
+            </div>
+        </div>
+    );
+};
